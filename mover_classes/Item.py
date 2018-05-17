@@ -2,6 +2,30 @@ import os
 import inspect
 import shutil
 import re
+import pickle
+
+
+class Incrementer:
+
+    def __init__(self, seed: int=38) -> None:
+
+        if not os.path.exists("inc.pkl"):
+            self.incr = seed
+            self.p_file = open('inc.pkl', 'wb')
+            self.p_file.close()
+        else:
+            self.p_file = open('inc.pkl', 'rb')
+            self.incr = pickle.load(self.p_file)
+            self.p_file.close()
+
+    def get_next_incr(self):
+        self.incr += 1
+        pickle.dump(self.incr, open('inc.pkl', 'wb'))
+        return self.incr
+
+    def set_inc(self, i):
+        self.incr = i
+        pickle.dump(self.incr, open('inc.pkl', 'wb'))
 
 
 class ItemBase(object):
@@ -154,3 +178,9 @@ class AItem(ItemBase):
 
     def write_confidential(self):
         print()
+
+
+if __name__ == '__main__':
+    inc = Incrementer()
+    inc.set_inc(44)
+    #print(inc.get_next_incr())

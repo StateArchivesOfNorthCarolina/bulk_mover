@@ -2,14 +2,17 @@ import os
 import sys
 import stat
 from shutil import rmtree
-from mover_classes.Item import PItem
-from Scripts.sanc_bagger import SANCBagger
-from mover_classes.CopyProgress import CopyProgress
 import yaml
 import logging
 import logging.config
 from bagit import BagValidationError
 import time
+
+from mover_classes.Item import PItem
+from Scripts.sanc_bagger import SANCBagger
+from mover_classes.CopyProgress import CopyProgress
+from mover_classes.PathUnique import PathUnique
+from mover_classes.MoverDBs import *
 
 
 class Mover:
@@ -124,7 +127,7 @@ class Mover:
             self.moved.write("{}\t{}\t{}\t{}\n".format(p_item.current_location, p_item.get_p_root(),
                                                        time.strftime("%Y-%m-%d", time.gmtime()), "Script"))
             self.moved.flush()
-            # No Move on to the next item.
+            # No Move on to the next level_5.
             return Mover.NEW_LOOP
 
         # 2) Is the source valid
@@ -166,10 +169,22 @@ class Mover:
         self.logger.info("START\t{}".format(self.file_name))
         self.review = open(self.not_moved_log, 'w')
         self.moved = open(self.moved_log, 'w')
+        pu = PathUnique()
         for p_item in self.move_items:
-            # Verify the source #
-            self.logger.info("BEGIN: \t{}\t{}".format(p_item.current_location, p_item.get_p_root()))
 
+            if not pu.is_unique(p_item.get_p_root()):
+                self.logger.error("DEST_NOT_UNIQUE: {}\n".format(p_item.get_p_root()))
+                self.review.write("{}\t{}\t{}\t{}\t{}\n".format("DEST NOT UNIQUE",
+                                                        p_item.current_location,
+                                                        p_item.get_p_root(),
+                                                        pu.current_path[0],
+                                                        pu.current_path[1]))
+                continue
+            else:
+                pu.add_to_paths(p_item.current_location, p_item.get_p_root())
+
+            self.logger.info("BEGIN: \t{}\t{}".format(p_item.current_location, p_item.get_p_root()))
+            # Verify the source #
             if p_item.do_both_exist():
                 if self._full_validate(p_item.get_p_root()):
                     try:
@@ -283,20 +298,18 @@ class Mover:
 
 
 def file_chooser():
-    files = os.listdir("L:\\Intranet\\ar\Digital_Services\\Inventory\\004_COMPLETED")
+    files = os.listdir("L:\\Intranet\\ar\Digital_Services\\Inventory\\002_TO_BE_MOVED")
     for i in range(len(files)):
         print("{})\t{}".format(i, files[i]))
 
     sel = input("Which file do you want to process: ")
-    print("\n{}\t{}".format("1)", "S to P"))
-    print("\n{}\t{}".format("1)", "P to A"))
-    type = input("Is this a move from S to P or P to A?")
     return files[int(sel)]
 
 
 if __name__ == "__main__":
     args = sys.argv
-
+    val = False
+    pu = PathUnique()
     source_fn = file_chooser()
     pre = False
     if len(args) > 1:
@@ -311,13 +324,23 @@ if __name__ == "__main__":
     for f in comp_move.readlines():
         l = f.strip().split("\t")
         if not pre:
-            item_list.append(PItem(l, False))
+            pi = PItem(l, False)
+            pr = pi.get_p_root()
+            if val:
+                if pu.is_unique(pr):
+                    item_list.append(pi)
+                else:
+                    print("NOT UNIQUE: {}\t{}".format(pi.current_location, pr))
+                    sys.exit(-1)
+            else:
+                item_list.append(pi)
         else:
             p = PItem(l, True)
             p.p_location = l[1]
             p.current_location = l[0]
             item_list.append(p)
-
+    if val:
+        pu.save()
     mv = Mover(item_list, comp_move.name)
     mv.moved_log = moved
     mv.not_moved_log = not_moved

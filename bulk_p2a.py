@@ -1,70 +1,65 @@
 import os
 from shutil import copyfile
-from shutil import copyfileobj
 import yaml
 import logging
 import logging.config
-import filetype
-from mover_classes.ConvertImgFile import ConvertImgFile
-from mover_classes.ConvertAvFile import ConvertAudioFile
-from mover_classes.ConvertAvFile import ConvertVideoFile
-from pathlib import Path
-from mover_classes.ConvertAvFile import ConvertAvFile
-from tqdm import tqdm
 
-class MoveInfo:
+from datetime import date
+from datetime import datetime
+from peewee import *
+from mover_classes.PathMunger import PathMunger
+from mover_classes.ConvertImgFile import ConvertImgError
+import re
 
-    def __init__(self, finfo: tuple) -> None:
-        self.p_file = finfo[0]
-        self.a_root = finfo[1]
-        self.a_file = finfo[2]
-        self.original_loc = finfo[3]
-        self.mime = finfo[4]
-        self.file = finfo[5]
-        self.p_root = finfo[6]
+db = SqliteDatabase('ptoa_conversion.db', pragmas=(('foreign_keys', 'on'),))
 
 
-class RootConvert:
-    def __init__(self, inf: str, ext: str=None) -> None:
-        self.in_file = inf
-        self.in_file_name = os.path.basename(self.in_file)
-        self.out_file_name = None
-        self.out_file = None
-        self.ext = ext
-        self.l_base = None
-        self.r_base = None
-        self._get_bases()
-        self.convert()
+class BaseModel(Model):
+    class Meta:
+        database = db
 
-    def _get_bases(self):
-        # get the dest base
-        bp = os.path.dirname(self.in_file)
-        _, in_base = os.path.splitdrive(bp)
-        bases = in_base.split("data")
-        self.l_base = "A:" + str(bases[0]) + str(bases[1])
-        if not os.path.exists(self.l_base):
-            os.mkdir(self.l_base)
 
-    def convert(self):
-        fname, ext = os.path.splitext(self.in_file_name)
-        self.out_file_name = fname + self.ext
-        self.out_file = os.path.join(self.l_base, self.out_file_name)
+class PtoADB(BaseModel):
+    p_root = TextField(unique=True)
+    completed_conversion = BooleanField(default=False)
+    date_completed = DateTimeField(null=True)
+
+
+class PtoAFiles(BaseModel):
+    root = ForeignKeyField(PtoADB)
+    p_file_name = TextField()
+    p_file_size = BigIntegerField()
+    a_file_name = TextField()
+    a_file_size = BigIntegerField()
+    completed = BooleanField(default=False)
+    date_completed = DateTimeField()
+
+db.connect()
+
+try:
+    db.create_tables([PtoADB, PtoAFiles])
+except OperationalError as e:
+    pass
 
 
 class PMover:
-    CONVERT_EXTS = {'.dv': 'video/x-dv',
-                    '.mxf': 'video/mxf'}
 
-    def __init__(self, source_file: str=None) -> None:
+    def __init__(self, source_file: str=None, drivel: str=None) -> None:
         self._build_basic_logger()
         self.logger = logging.getLogger("AMover")
         self.source_file = open(os.path.join("L:\\Intranet\\ar\Digital_Services\\Inventory\\004_COMPLETED", source_file), 'r')
-        self.success_move = open("L:\\Intranet\\ar\\Digital_Services\\Inventory\\005_A_COMPLETE\\{}"
-                                 .format(source_file.split(".")[0] + ".tsv"), 'w')
-        self.review = open("L:\\Intranet\\ar\\Digital_Services\\Inventory\\007_A_REVIEW\\{}".format("A_MOVES.tsv"),
-                           'a')
+        s = source_file.split(".")[0]
+        self.success_move = open("L:\\Intranet\\ar\\Digital_Services\\Inventory\\005_A_COMPLETE\\{}.tsv"
+                                 .format(s), 'w')
+
+        self.review = open("L:\\Intranet\\ar\\Digital_Services\\Inventory\\007_A_REVIEW\\{}.tsv".format(s),
+                           'w')
         self.current_path_origin = str()
         self.num_files_in_path = int()
+        self.dest_drive = "T:"
+        self.restricted_dir = False
+        if drivel is not None:
+            self.dest_drive = drivel
 
     def _build_basic_logger(self):
         log_dir = os.path.join(os.getcwd(), 'logs')
@@ -85,135 +80,262 @@ class PMover:
         for line in self.source_file.readlines():
             l = line.strip().split("\t")
             self.current_path_origin = l[0]
-            yield l[1], os.path.join(l[1], "data")
+            yield l[1]
 
-    def get_next_file_path(self, p):
+    @staticmethod
+    def get_next_file_path(p):
         for root, dirs, files in os.walk(p):
             for f in files:
                 if f == "Thumbs.db":
                     continue
                 yield root, f
 
-    def magic_handling(self, cur_file: str):
-        k = filetype.guess(cur_file)
-        if k is None:
-            return False
-        mime = k.mime
-        return mime
-
     def _get_numfiles_in_p(self, p):
         print("Analyizing path...")
         for __, __, files in os.walk(p):
             self.num_files_in_path += len(files)
 
-    def _get_a_root(self, file_root):
-        pre = file_root.split(os.path.sep)[1:]
-        a_base = os.path.join("A:\\", "\\".join(pre))
-        return a_base
+    def _handle_img(self, pm: PathMunger):
+        try:
+            cif = pm.get_img_converter()
+            pm.set_dest_file_name(cif.which_ext())
+            cif.img_out = pm.get_dest_file_path()
+            if pm.is_dest_there():
+                return True
 
-    def _get_rel_file(self, cur_root, bag_path):
-        r = os.path.relpath(cur_root, bag_path)
-        if r == '.':
-            return ''
+            if not cif.needs_conversion():
+                if not pm.do_a_copy():
+                    return False
+                return True
+
+            if cif.convert():
+                return True
+            return False
+        except ConvertImgError:
+            return False
+
+    def _handle_audio(self, pm: PathMunger):
+        caf = pm.get_audio_converter()
+        caf.mime = pm.source_mime
+        pm.set_dest_file_name(caf.which_ext())
+        caf.av_out = pm.get_dest_file_path()
+        if pm.is_dest_there():
+            return True
+
+        if not caf.needs_conversion():
+            if not pm.do_a_copy():
+                return False
+            return True
+
+        if pm.is_dest_there():
+            # Write Success
+            return True
+        if not caf.convert():
+            # Fail
+            return False
+
+    def _handle_video(self, pm: PathMunger):
+        cav = pm.get_video_converter()
+        cav.mime = pm.source_mime
+        pm.set_dest_file_name(cav.which_ext())
+        cav.av_out = pm.dest_file_path
+        if pm.is_dest_there():
+            return True
+
+        if not cav.needs_conversion():
+            pm.do_a_copy()
+            return True
+
+        if cav.convert():
+            return True
+        return False
+
+    def _handle_document(self, pm: PathMunger):
+        cdf = pm.get_document_converter()
+        pm.set_dest_file_name(".pdf")
+        cdf.fout = pm.get_dest_file_path()
+        cdf.mime = pm.source_mime
+        # Is this a no_access_file
+        if cdf.is_no_access_file():
+            if self._handle_no_access(pm):
+                return True
+            return False
+
+        # No proceed with potential conversion
+        if pm.is_dest_there():
+            return True
+        elif not pm.needs_conversion():
+            pm.do_a_copy()
+            return True
+
+        if cdf.convert():
+            return True
+        return False
+
+    def _handle_no_access(self, pm: PathMunger):
+        cna = pm.get_noaccess_converter()
+        pm.set_dest_file_name(".txt")
+        cna.fout = pm.get_dest_file_path()
+        if pm.is_dest_there():
+            return True
+        if cna.convert():
+            return True
+        return False
+
+    def _write_success(self, pm: PathMunger):
+        self.logger.info(pm.get_success_message()[0])
+        self.success_move.write(pm.get_success_message()[1])
+        self.__write_ptoa(pm)
+
+    def _write_fail(self, pm: PathMunger):
+        self.logger.info(pm.get_fail_message(pm.get_error())[0])
+        self.review.write(pm.get_fail_message(pm.get_error())[1])
+        self.__write_ptoa(pm, False)
+
+    def _handle_conversion(self, pm: PathMunger):
+        mime = pm.get_mime_type()
+
+        if mime == "image":
+            if self._handle_img(pm):
+                return True
+        if mime == "audio":
+            if self._handle_audio(pm):
+                return True
+        if mime == "video":
+            self._handle_video(pm)
+        if mime == "sanc_document" or mime == "application":
+            if self._handle_document(pm):
+                return True
+        if mime == "sanc_no_access":
+            if self._handle_no_access(pm):
+                return True
+
+        return False
+
+    def _handle_restricted(self, pm: PathMunger):
+        pm.is_no_access = True
+        if self._handle_no_access(pm):
+            self._write_success(pm)
+            return True
         else:
-            return r
+            self._write_fail(pm)
+            return False
 
-    def _write_success(self, rc: RootConvert, f: MoveInfo):
-        self.logger.info("COPIED: \t{} \t--->\t {}".format(rc.in_file, rc.out_file))
-        self.success_move.write("{}\t{}".format(os.path.join(f.original_loc, f.file), rc.out_file))
+    def _is_restricted(self, pm: PathMunger):
+        rest_strings = [r'\NP\SR', r'\RS']
+        for i in rest_strings:
+            if pm.source_file.__contains__(i):
+                return True
+        return False
 
-    def _write_fail(self, rc: RootConvert, f: MoveInfo, error_msg: str):
-        self.logger.info("NOT COPIED: \t{} \t--->\t {}".format(rc.in_file, error_msg))
-        self.review.write("{}\t{}\t{}".format(os.path.join(f.original_loc, f.file), rc.in_file, rc.out_file))
+    def _is_a_blank_path(self, p: str):
+        regexs = [r"^.*(\\\\RS)",
+                  r"^.*(\\\\GS)",
+                  r"^.*(\\06002)",
+                  r"^.*(\\33435)",
+                  r"Email",
+                  r"email",
+                  r"database",
+                  r"Database"]
 
-    def _handle_img(self, f: MoveInfo):
-        rc = RootConvert(f.p_file, ".jpg")
-        ci = ConvertImgFile(f.p_file, f.mime, f.a_file)
-        if os.path.exists(ci.img_out):
-            self._write_success(rc, f)
-            return
+        if re.match("|".join('(?:{0})'.format(x) for x in regexs), p):
+            return True
+        return False
 
-        if not ci.needs_conversion():
-            copyfile(rc.in_file, rc.out_file)
+    def quick_move(self):
+        pass
+
+    def __write_ptoa(self, pm: PathMunger, success=True):
+        ptoa_files = PtoAFiles()
+        ptoa_files.root = globals()['__P2ADB__']
+        ptoa_files.p_file_name = pm.get_source_file_path()
+        ptoa_files.p_file_size = os.path.getsize(pm.get_source_file_path())
+        ptoa_files.a_file_name = pm.get_dest_file_path()
+        try:
+            ptoa_files.a_file_size = os.path.getsize(pm.get_dest_file_path())
+        except OSError as e:
+            ptoa_files.a_file_size = 0
+
+        if success:
+            ptoa_files.completed = True
+            ptoa_files.date_completed = datetime.now()
         else:
-            if ci.convert(rc.out_file):
-                self._write_success(rc, f)
-            else:
-                self._write_fail(rc, f, ci.error_msg)
-
-    def _handle_audio(self, f: MoveInfo):
-        rc = RootConvert(f.p_file, ".m4a")
-        ca = ConvertAudioFile(rc.in_file, rc.out_file)
-        if os.path.exists(rc.out_file):
-            self._write_success(rc, f)
-            return
-
-        if ca.needs_conversion(f.mime):
-            if ca.convert(rc.out_file):
-                self._write_success(rc, f)
-            else:
-                self._write_fail(rc, f, "Process did not complete")
-        else:
-            copyfile(rc.in_file, rc.out_file)
-
-    def _handle_video(self, f: MoveInfo):
-        rc = RootConvert(f.p_file, ".m4v")
-        va = ConvertVideoFile(rc.in_file, rc.out_file)
-        if os.path.exists(rc.out_file):
-            self._write_success(rc, f)
-            return
-
-        if va.needs_conversion(f.mime):
-            if va.convert(rc.out_file):
-                self._write_success(rc, f)
-            else:
-                self._write_fail(rc, f, "Process did not complete")
-        else:
-            copyfile(rc.in_file, rc.out_file)
+            ptoa_files.completed = False
+            ptoa_files.date_completed = datetime.now()
+        ptoa_files.save()
 
     def move(self):
-        for base_path, bag_path in self.next_path():
-            self.logger.info("MOVING: \t{}".format(base_path))
-            for root, file in self.get_next_file_path(bag_path):
+        for base_path in self.next_path():
+            pm = PathMunger(base_path, "T:")
+            self.logger.info("CONVERTING: \t{}".format(pm.get_source_bag()))
+            p_root_db = None
+            l = []
+            try:
+                p_root_db = PtoADB.create(p_root=pm.get_source_bag())
+            except Exception as e:
+                p_root_db = PtoADB.get(PtoADB.p_root == pm.get_source_bag())
+                if p_root_db.completed_conversion:
+                    self.logger.info("Already Converted: \t{}".format(pm.get_source_bag()))
+                    continue
+                else:
+                    # Find files in this root that are converted
+                    for f in PtoAFiles.select().where(PtoAFiles.root == p_root_db):
+                        l.append(f.p_file_name)
 
-                p_file = os.path.join(root, file)
-                a_root = self._get_a_root(base_path)
-                a_file = os.path.join(a_root, file)
-                original_loc = os.path.join(self.current_path_origin, self._get_rel_file(root, bag_path))
-                mime = self.magic_handling(os.path.join(root, file))
-                finfo = MoveInfo((p_file, a_root, None, original_loc, mime, file, base_path))
-
-                if not mime:
-                    copyfile(p_file, a_file)
-                    self.logger.info("COPIED: \t{} \t--->\t {}".format(p_file, a_file))
-                    self.success_move.write("{}\t{}".format(os.path.join(original_loc, file), a_file))
+            globals()['__P2ADB__'] = p_root_db
+            for root, file in self.get_next_file_path(pm.get_source_bag()):
+                if os.path.join(root, file) in l:
+                    continue
+                pm = PathMunger(base_path, "T:")
+                pm.set_current_targets(root, file)
+                pm.create_dest_path()
+                # Handle Restricted Files
+                if self._is_a_blank_path(pm.source_base):
+                    if self._handle_restricted(pm):
+                        self._write_success(pm)
+                    else:
+                        self._write_fail(pm)
                     continue
 
-                if mime.split("/")[0] == "image":
-                    self._handle_img(finfo)
-                    continue
+                ext = os.path.splitext(file)[1]
+                if len(ext) < 4 or len(ext) > 5:
+                    # Extension will not be determinable go ahead and copy
+                    if pm.do_a_copy():
+                        self._write_success(pm)
 
-                if mime.split("/")[0] == "audio":
-                    self._handle_audio(finfo)
-                    continue
+                if pm.is_pass_through():
+                    if pm.is_dest_there():
+                        self._write_success(pm)
+                        continue
+                    if pm.do_a_copy():
+                        self._write_success(pm)
+                        continue
+                    self._write_fail(pm)
+                else:
+                    if self._handle_conversion(pm):
+                        self._write_success(pm)
+                    else:
+                        self._write_fail(pm)
 
-                if mime.split("/")[0] == "video":
-                    self._handle_video(finfo)
-                    continue
+            p_root_db.completed_conversion = True
+            p_root_db.date_completed = datetime.now()
+            p_root_db.save()
 
     def close(self):
         self.source_file.close()
         self.success_move.close()
         self.review.close()
 
+
 def file_chooser():
     base_path = "L:\\Intranet\\ar\Digital_Services\\Inventory\\004_COMPLETED"
     files = os.listdir(base_path)
     for i in range(len(files)):
-        print("{})\t{}".format(i, files[i]))
+        i += 1
+        print("{})\t{}".format(i, files[i - 1]))
 
     sel = input("Which file do you want to process: ")
-    return files[int(sel)]
+    return files[int(sel) - 1]
 
 
 if __name__ == "__main__":
